@@ -75,7 +75,7 @@ A binary classifier trained on `(symbol, date)` rows that predicts whether a sym
 | **Label** | `1` if `forward_60d_return > spy_forward_60d_return + 0.05`, else `0`. ~29% positive rate. |
 | **Cross-validation** | `TimeSeriesSplit(n_splits=5)` — train on past folds, test on future. No random shuffling, no leakage across the time boundary. |
 | **Features** | 30 columns — technical · SPY regime · fundamentals · valuation · earnings · cross-asset macro (see below) |
-| **Model** | `GradientBoostingClassifier(n_estimators=500, max_depth=3, learning_rate=0.02)` — sklearn default-shape tree boosting. LightGBM alt path under `train_lgb.py`. |
+| **Model** | LightGBM (`train_lgb.py` + `train_all.sh`) — three variants from the same CSV via `--drop` lists. Earlier sklearn `GradientBoostingClassifier` path retained for parity. Isotonic-calibrated post-fit so the probability rank matches realized rates. |
 | **Serialization** | Trees flattened to parallel `feature`/`threshold`/`left`/`right`/`value` arrays in JSON. Go reads them at boot and evaluates `sigmoid(init + Σ lr · tree(x))` per request. No Python at serve time. |
 
 ### The three sub-models
@@ -84,9 +84,9 @@ Instead of one black-box, the same training pipeline produces three scorers from
 
 | Model | Features | CV AUC | Question it answers |
 |-------|----------|--------|---------------------|
-| **Combined** | all 30 | **0.580** | Holistic — best single number |
-| **Technical** | price · MA · RSI · fundamentals · valuation | **0.570** | "Is the chart + book saying buy?" |
-| **Human nature** | VIX · DXY · oil · gold · earnings reaction · cross-asset | **0.548** | "Is the macro/sentiment backdrop friendly?" |
+| **Combined** | all 30+ | **0.594** | Holistic — best single number |
+| **Technical** | price · MA · RSI · fundamentals · valuation | **0.572** | "Is the chart + book saying buy?" |
+| **Human nature** | VIX · DXY · oil · gold · earnings reaction · cross-asset · news sentiment | **0.557** | "Is the macro/sentiment backdrop friendly?" |
 
 Combined is the user-facing badge; the sub-models render as context badges so a user can spot "tech says buy, but the macro side is inconclusive". A model with `cv_auc < AUC_FLOOR` (0.55 for combined, 0.50 for sub-models) is hidden — a useless model has no business driving UI.
 
@@ -106,7 +106,7 @@ Cross-asset (6): vix_level, vix_chg_20d, dxy_chg_20d, oil_chg_20d, gold_chg_20d,
 
 ### Why ~0.58 ceiling?
 
-0.55–0.58 is the realistic ceiling for **public daily-bar data on large-caps**:
+0.55–0.59 is the realistic ceiling for **public daily-bar data on large-caps**:
 
 - The market is efficient — anything obvious in price + filings is already arbitraged.
 - 60-day labels are mostly macro noise (VIX, rates) plus idiosyncratic news.
@@ -114,6 +114,51 @@ Cross-asset (6): vix_level, vix_chg_20d, dxy_chg_20d, oil_chg_20d, gold_chg_20d,
 - No alternative data → no 0.65+ paths. (Adding VADER news sentiment is on the roadmap.)
 
 The combined badge is **honestly framed as a tiebreaker, not an oracle**. The AUC floor + sub-model breakdown keep the UX from overclaiming.
+
+## Auto-trader (paper money)
+
+Once the signal was good enough to backtest with a positive Sharpe, the next question was: **does this hold up against real fills and slippage?** A paper-money auto-trader closes the loop end-to-end.
+
+| Layer | Detail |
+|-------|--------|
+| **Broker** | Alpaca paper API — bracket orders (entry + take-profit + stop) submitted at NY close, mirrors real US market 9:30–16:00 ET. |
+| **Two gates, one binary** | `strict` (ml ≥ 0.34, rr ≥ 2.0, blockDC on) writes to the main P&L journal. `shadow` (ml ≥ 0.25, blockDC off) writes to a `-shadow` CID-suffixed journal so realized returns can be compared without contaminating the strict strategy. |
+| **Risk gates** | Per-trade sizing capped at `AUTO_TRADE_PCT_EQUITY` (default 1% equity). Total deployed capped at `AUTO_TRADE_MAX_DEPLOYED` (default 30%). Trading halts when realized drawdown hits `AUTO_TRADE_HALT_DRAWDOWN` (default 10%) — file-tracked starting equity prevents reset-on-restart. |
+| **Per-cycle cap** | Max 15 orders per fire — keeps any one bad day from blowing the budget. |
+| **Idempotent re-fire** | Dedups against existing open positions before submitting — a double-fired cycle (catch-up or reboot) is a no-op for symbols already held. |
+| **In-DMS scheduler** | `robfig/cron` loop inside the DMS process. Strict at 15:30 ET, shadow at 16:00 ET, Mon-Fri. File-based last-run tracker (`data/autotrader_schedule.json`) catches up missed fires after reboots within the same trading day, with a first-boot grace seeded to today to avoid replay storms after a fresh deploy. |
+| **Shadow grader** | `cmd/shadow_grader` walks yesterday's `shadow_picks.csv` and grades against realized next-day returns. Outputs hit-rate / P&L drift per gate, feeding the next tuning round. |
+| **Single source of truth** | One DMS process owns scheduling, ML scoring, broker calls, and logging. Replaces two separate `launchd` plists — adding a new fire window now means editing a Go slice, not XML. |
+
+```mermaid
+flowchart LR
+    subgraph DMS["dms (one process)"]
+        Cron["robfig/cron<br/>15:30 + 16:00 ET"]
+        Catchup["catch-up tracker<br/>data/autotrader_schedule.json"]
+        Trader["cmd/auto_trader<br/>(subprocess)"]
+        ML["ML evaluator × 3"]
+        Risk["risk gates<br/>halt-drawdown · max-deployed · per-cycle cap"]
+    end
+    Alpaca[Alpaca paper API]
+    Journal[("trades.csv +<br/>shadow_picks.csv")]
+    Grader["cmd/shadow_grader<br/>(daily)"]
+
+    Cron --> Trader
+    Catchup --> Trader
+    Trader --> ML --> Risk --> Alpaca
+    Alpaca --> Journal
+    Journal --> Grader
+```
+
+### News pipeline
+
+A separate goroutine fans out news scoring nightly so the human-nature variant sees sentiment without paying the cost on every request:
+
+1. **04:00 ET — collect** (`cmd/news_collector`) — pulls last 24h of headlines per symbol from FMP, writes `news_raw.csv`.
+2. **04:05 ET — score** (`cmd/training/score_news.py`) — FinBERT (`ProsusAI/finbert`) classifies each headline, aggregates per-symbol mean + recency-weighted sentiment, writes `news_sentiment.csv`.
+3. **04:10 ET — reload** — atomic in-memory swap of the news store. No DMS restart. Failures keep yesterday's sentiment rather than nulling.
+
+FinBERT (not VADER) was chosen because it's domain-trained on financial text — "beat estimates by a penny" reads as positive to FinBERT but neutral to VADER's general-purpose lexicon.
 
 ## Training pipeline
 
@@ -256,12 +301,15 @@ Secondary goals:
 
 ## Roadmap
 
-- Form 4 PIT insider buying refactor (currently 30d window, no PIT filing-date awareness)
-- Sector-relative feature engineering (vs sector ETF, not just SPY)
-- VADER news sentiment via Yahoo news titles
-- Ensemble: GBM + LightGBM + XGBoost stacked
-- IPO calendar UI (DMS layer ready; AMS page pending)
-- Per-stock IPO badge on /chart/SYMBOL for recently-listed tickers
+Shipped since last update: news pipeline (FinBERT, not VADER), LightGBM as the primary trainer with isotonic calibration, IPO calendar UI, trade journal page, performance dashboard, paper-money auto-trader with strict + shadow gates, in-DMS scheduler replacing launchd plists.
+
+Next:
+- **Backtest-driven gate tuning** — automate the 48-config sweep (ml floor × rr floor × hold days × top-K) → pick the strict gate parameters with the best out-of-sample Sharpe.
+- **OCR watchlist import** — point a phone at a Firstrade/broker screenshot, OCR the symbols, bulk-add to the watchlist.
+- **Higher model confidence** — currently AUC 0.55–0.59; the long-term north star is to graduate to quant-trading-caliber signal density.
+- **Form 4 PIT insider buying refactor** — currently 30d window with no PIT filing-date awareness.
+- **Sector-relative features** — vs sector ETF, not just SPY.
+- **Ensemble** — LightGBM + XGBoost + GBM stacked.
 
 ## Author
 
